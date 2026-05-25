@@ -197,18 +197,45 @@ def get_shopify_variant_by_sku(sku):
     return None
 
 
-def update_shopify_inventory(inventory_item_id, location_id, new_quantity):
-    """Set the inventory level for a specific item at a location."""
-    url = f"https://{SHOPIFY_STORE_URL}/admin/api/2024-01/inventory_levels/set.json"
-        headers = get_shopify_headers()
-    payload = {
-        "location_id":        int(location_id),
-        "inventory_item_id":  int(inventory_item_id),
-        "available":          int(new_quantity)
+def get_shopify_current_quantity(inventory_item_id, location_id):
+    """Get the current inventory quantity from Shopify."""
+    url = f"https://{SHOPIFY_STORE_URL}/admin/api/2024-01/inventory_levels.json"
+    params = {
+        "inventory_item_ids": inventory_item_id,
+        "location_ids": location_id
     }
-    resp = requests.post(url, json=payload, headers=headers)
+    resp = requests.get(url, headers=get_shopify_headers(), params=params)
+    data = resp.json()
+    levels = data.get("inventory_levels", [])
+    if levels:
+        return int(levels[0].get("available") or 0)
+    return 0
+
+
+def update_shopify_inventory(inventory_item_id, location_id, new_quantity):
+    """
+    Set the inventory level using adjustment.
+    Calculates the difference between desired and current quantity.
+    """
+    # Get current quantity first
+    current_qty = get_shopify_current_quantity(inventory_item_id, location_id)
+    adjustment = int(new_quantity) - current_qty
+
+    logger.info(f"[Shopify] Current: {current_qty}, Target: {new_quantity}, Adjustment: {adjustment}")
+
+    if adjustment == 0:
+        logger.info(f"[Shopify] No change needed, skipping.")
+        return True
+
+    url = f"https://{SHOPIFY_STORE_URL}/admin/api/2024-01/inventory_levels/adjust.json"
+    payload = {
+        "location_id":            int(location_id),
+        "inventory_item_id":      int(inventory_item_id),
+        "available_adjustment":   adjustment
+    }
+    resp = requests.post(url, json=payload, headers=get_shopify_headers())
     if resp.status_code == 200:
-        logger.info(f"✅ Shopify updated: item {inventory_item_id} → {new_quantity} units")
+        logger.info(f"✅ Shopify updated: item {inventory_item_id} → {new_quantity} units (adj: {adjustment:+d})")
         return True
     else:
         logger.error(f"❌ Shopify update failed: {resp.status_code} {resp.text}")
