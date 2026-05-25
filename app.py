@@ -147,7 +147,7 @@ def get_shopify_variant_by_sku(sku):
     Search Shopify for a product variant matching the given SKU.
     Returns dict with variant_id, inventory_item_id, location_id or None.
     """
-        headers = get_shopify_headers()
+    headers = get_shopify_headers()
     graphql_url = f"https://{SHOPIFY_STORE_URL}/admin/api/2024-01/graphql.json"
     query = """
     query getVariantBySku($query: String!) {
