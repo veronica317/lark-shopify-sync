@@ -1,144 +1,60 @@
 """
-Lark Base ↔ Shopify Two-Way Inventory Sync
-===========================================
-Direction 1: Lark Base → Shopify
+Lark Base <-> Shopify Two-Way Inventory Sync
+=============================================
+Direction 1: Lark Base -> Shopify
   - Triggered by Lark Base Automation when "Available Stock" changes
-  - Finds matching SKU in Shopify and updates inventory level
+  - Finds matching SKU in Shopify and sets inventory level
 
-Direction 2: Shopify → Lark Base
-  - Triggered by Shopify order/fulfillment webhook
-  - Finds matching SKU in Lark Base and updates "Available Stock"
+Direction 2: Shopify -> Lark Base
+  - Triggered by Shopify order created webhook
+  - Deducts ordered quantities from Lark Base
 
-Deploy on Render.com (free tier)
+Direction 3: Shopify Order Cancelled -> Lark Base
+  - Restores cancelled quantities back to Lark Base
 """
 
 import os
 import json
 import hmac
+import time
 import hashlib
 import base64
 import logging
 import requests
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, redirect
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ─── CONFIG (set these as Environment Variables on Render) ─────────────────────
-SHOPIFY_STORE_URL     = os.environ.get("SHOPIFY_STORE_URL")         # e.g. yourstore.myshopify.com
-SHOPIFY_ACCESS_TOKEN  = os.environ.get("SHOPIFY_ACCESS_TOKEN")      # Admin API access token (shpat_) OR leave blank if using Client ID/Secret
-SHOPIFY_CLIENT_ID     = os.environ.get("SHOPIFY_CLIENT_ID")         # Dev Dashboard Client ID
-SHOPIFY_CLIENT_SECRET = os.environ.get("SHOPIFY_CLIENT_SECRET")     # Dev Dashboard Client Secret
-SHOPIFY_WEBHOOK_SECRET= os.environ.get("SHOPIFY_WEBHOOK_SECRET")    # Shopify webhook signing secret
-LARK_APP_ID           = os.environ.get("LARK_APP_ID")               # From open.larksuite.com
-LARK_APP_SECRET       = os.environ.get("LARK_APP_SECRET")           # From open.larksuite.com
-LARK_BASE_ID          = os.environ.get("LARK_BASE_ID")              # From your Lark Base URL
-LARK_TABLE_ID         = os.environ.get("LARK_TABLE_ID")             # From your Lark Base URL
-WEBHOOK_SECRET        = os.environ.get("WEBHOOK_SECRET", "")        # Your own secret for Lark→Shopify
-# ───────────────────────────────────────────────────────────────────────────────
+# ── CONFIG ────────────────────────────────────────────────────────────────────
+SHOPIFY_STORE_URL      = os.environ.get("SHOPIFY_STORE_URL", "")       # e.g. yourstore.myshopify.com
+SHOPIFY_CLIENT_ID      = os.environ.get("SHOPIFY_CLIENT_ID", "")       # Dev Dashboard Client ID
+SHOPIFY_CLIENT_SECRET  = os.environ.get("SHOPIFY_CLIENT_SECRET", "")   # Dev Dashboard Secret
+SHOPIFY_WEBHOOK_SECRET = os.environ.get("SHOPIFY_WEBHOOK_SECRET", "")  # Shopify webhook signing secret
+LARK_APP_ID            = os.environ.get("LARK_APP_ID", "")             # From open.larksuite.com
+LARK_APP_SECRET        = os.environ.get("LARK_APP_SECRET", "")         # From open.larksuite.com
+LARK_BASE_ID           = os.environ.get("LARK_BASE_ID", "")            # From Lark Base URL
+LARK_TABLE_ID          = os.environ.get("LARK_TABLE_ID", "")           # From Lark Base URL
+WEBHOOK_SECRET         = os.environ.get("WEBHOOK_SECRET", "")          # Your secret for Lark automation
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# LARK HELPERS
+# SHOPIFY TOKEN (short-lived, auto-refreshed)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def get_lark_access_token():
-    """Get a tenant access token from Lark API."""
-    url = "https://open.larksuite.com/open-apis/auth/v3/tenant_access_token/internal"
-    resp = requests.post(url, json={
-        "app_id": LARK_APP_ID,
-        "app_secret": LARK_APP_SECRET
-    })
-    data = resp.json()
-    if data.get("code") != 0:
-        raise Exception(f"Lark auth failed: {data}")
-    return data["tenant_access_token"]
+_token_cache = {"token": None, "expires_at": 0}
 
-
-def find_lark_record_by_sku(token, sku):
+def get_shopify_token():
     """
-    Search Lark Base for a record matching the given SKU.
-    Returns (record_id, current_stock) or (None, None).
+    Exchange Client ID + Secret for a short-lived Shopify access token.
+    Tokens expire every 24h. Cached and auto-refreshed.
     """
-    url = (
-        f"https://open.larksuite.com/open-apis/bitable/v1/"
-        f"apps/{LARK_BASE_ID}/tables/{LARK_TABLE_ID}/records/search"
-    )
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "filter": {
-            "conjunction": "and",
-            "conditions": [
-                {
-                    "field_name": "Variant SKU",
-                    "operator": "is",
-                    "value": [sku]
-                }
-            ]
-        }
-    }
-    resp = requests.post(url, json=payload, headers=headers)
-    data = resp.json()
-
-    items = data.get("data", {}).get("items", [])
-    if not items:
-        logger.info(f"SKU '{sku}' not found in Lark Base — skipping.")
-        return None, None
-
-    record = items[0]
-    record_id = record["record_id"]
-    current_stock = record.get("fields", {}).get("Available Stock", 0)
-    return record_id, current_stock
-
-
-def update_lark_stock(token, record_id, new_quantity):
-    """Update the Available Stock field in a Lark Base record."""
-    url = (
-        f"https://open.larksuite.com/open-apis/bitable/v1/"
-        f"apps/{LARK_BASE_ID}/tables/{LARK_TABLE_ID}/records/{record_id}"
-    )
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "fields": {
-            "Available Stock": new_quantity
-        }
-    }
-    resp = requests.put(url, json=payload, headers=headers)
-    if resp.status_code == 200:
-        logger.info(f"✅ Lark Base updated: record {record_id} → {new_quantity} units")
-        return True
-    else:
-        logger.error(f"❌ Lark Base update failed: {resp.status_code} {resp.text}")
-        return False
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# SHOPIFY HELPERS
-# ══════════════════════════════════════════════════════════════════════════════
-
-# Cache token to avoid fetching on every request
-_shopify_token_cache = {"token": None, "expires_at": 0}
-
-def get_shopify_access_token():
-    """
-    Get a valid Shopify access token using client credentials grant.
-    Tokens expire every 24 hours so we cache and refresh automatically.
-    """
-    import time
     now = time.time()
+    if _token_cache["token"] and now < _token_cache["expires_at"] - 300:
+        return _token_cache["token"]
 
-    # Return cached token if still valid (with 5 min buffer)
-    if _shopify_token_cache["token"] and now < _shopify_token_cache["expires_at"] - 300:
-        return _shopify_token_cache["token"]
-
-    # Fetch new token
     url = f"https://{SHOPIFY_STORE_URL}/admin/oauth/access_token"
     resp = requests.post(url, json={
         "client_id": SHOPIFY_CLIENT_ID,
@@ -147,44 +63,38 @@ def get_shopify_access_token():
     }, headers={"Content-Type": "application/json"})
 
     data = resp.json()
-    logger.info(f"[Shopify Token Response]: status={resp.status_code}")
-
     token = data.get("access_token")
-    expires_in = data.get("expires_in", 86400)  # default 24h
+    expires_in = data.get("expires_in", 86400)
 
     if not token:
-        raise Exception(f"Failed to get Shopify token: {data}")
+        raise Exception(f"Shopify token fetch failed: {data}")
 
-    _shopify_token_cache["token"] = token
-    _shopify_token_cache["expires_at"] = now + expires_in
-
-    logger.info(f"[Shopify] Got new access token, expires in {expires_in}s")
+    _token_cache["token"] = token
+    _token_cache["expires_at"] = now + expires_in
+    logger.info(f"[Shopify] New token fetched, expires in {expires_in}s")
     return token
 
 
-def get_shopify_headers():
-    """Build Shopify API headers with fresh access token."""
+def shopify_headers():
     return {
-        "X-Shopify-Access-Token": get_shopify_access_token(),
+        "X-Shopify-Access-Token": get_shopify_token(),
         "Content-Type": "application/json"
     }
 
 
-def get_shopify_token():
-    """Returns current access token."""
-    return get_shopify_access_token()
+# ══════════════════════════════════════════════════════════════════════════════
+# SHOPIFY: Find variant by SKU (also returns current stock)
+# ══════════════════════════════════════════════════════════════════════════════
 
-
-def get_shopify_variant_by_sku(sku):
+def get_shopify_variant(sku):
     """
-    Search Shopify for a product variant matching the given SKU.
-    Returns dict with variant_id, inventory_item_id, location_id or None.
+    Find a Shopify product variant by SKU using GraphQL.
+    Returns dict with inventory_item_id, location_id, current_qty, or None.
     """
-    headers = get_shopify_headers()
-    graphql_url = f"https://{SHOPIFY_STORE_URL}/admin/api/2024-01/graphql.json"
+    url = f"https://{SHOPIFY_STORE_URL}/admin/api/2024-01/graphql.json"
     query = """
-    query getVariantBySku($query: String!) {
-      productVariants(first: 10, query: $query) {
+    query getVariant($q: String!) {
+      productVariants(first: 5, query: $q) {
         edges {
           node {
             id
@@ -194,7 +104,7 @@ def get_shopify_variant_by_sku(sku):
               inventoryLevels(first: 1) {
                 edges {
                   node {
-                    id
+                    available
                     location { id }
                   }
                 }
@@ -205,402 +115,271 @@ def get_shopify_variant_by_sku(sku):
       }
     }
     """
-    gql_variables = {"query": f"sku:{sku}"}
-
-    resp = requests.post(graphql_url, json={"query": query, "variables": gql_variables}, headers=headers)
+    variables = {"q": f"sku:{sku}"}
+    resp = requests.post(url, json={"query": query, "variables": variables}, headers=shopify_headers())
     data = resp.json()
-    logger.info(f"[Shopify GraphQL Response]: {json.dumps(data)}")
+    logger.info(f"[Shopify] GraphQL response: {json.dumps(data)}")
 
     edges = data.get("data", {}).get("productVariants", {}).get("edges", [])
     for edge in edges:
         node = edge["node"]
         if node.get("sku") == sku:
             inv_item = node["inventoryItem"]
-            inv_levels = inv_item["inventoryLevels"]["edges"]
-            if not inv_levels:
-                logger.warning(f"SKU {sku} found but has no inventory levels.")
+            levels = inv_item["inventoryLevels"]["edges"]
+            if not levels:
+                logger.warning(f"[Shopify] SKU {sku} has no inventory levels")
                 return None
-            return {
-                "variant_id":        node["id"].split("/")[-1],
+            level = levels[0]["node"]
+            result = {
                 "inventory_item_id": inv_item["id"].split("/")[-1],
-                "location_id":       inv_levels[0]["node"]["location"]["id"].split("/")[-1]
+                "location_id":       level["location"]["id"].split("/")[-1],
+                "current_qty":       int(level.get("available") or 0)
             }
+            logger.info(f"[Shopify] Found SKU={sku}, current_qty={result['current_qty']}")
+            return result
 
-    logger.info(f"SKU '{sku}' not found in Shopify — skipping.")
+    logger.info(f"[Shopify] SKU '{sku}' not found — skipping")
     return None
 
 
-def get_shopify_current_quantity(inventory_item_id, location_id):
-    """Get the current inventory quantity from Shopify."""
-    url = f"https://{SHOPIFY_STORE_URL}/admin/api/2024-01/inventory_levels.json"
-    params = {
-        "inventory_item_ids": inventory_item_id,
-        "location_ids": location_id
-    }
-    resp = requests.get(url, headers=get_shopify_headers(), params=params)
-    data = resp.json()
-    levels = data.get("inventory_levels", [])
-    if levels:
-        return int(levels[0].get("available") or 0)
-    return 0
+# ══════════════════════════════════════════════════════════════════════════════
+# SHOPIFY: Update inventory using adjustment
+# ══════════════════════════════════════════════════════════════════════════════
 
-
-def update_shopify_inventory(inventory_item_id, location_id, new_quantity):
+def set_shopify_inventory(inventory_item_id, location_id, target_qty, current_qty):
     """
-    Set the inventory level using adjustment.
-    Calculates the difference between desired and current quantity.
+    Adjust Shopify inventory so it equals target_qty.
+    Uses adjust endpoint with delta = target - current.
     """
-    # Get current quantity first
-    current_qty = get_shopify_current_quantity(inventory_item_id, location_id)
-    adjustment = int(new_quantity) - current_qty
-
-    logger.info(f"[Shopify] Current: {current_qty}, Target: {new_quantity}, Adjustment: {adjustment}")
+    adjustment = int(target_qty) - int(current_qty)
+    logger.info(f"[Shopify] current={current_qty}, target={target_qty}, adjustment={adjustment:+d}")
 
     if adjustment == 0:
-        logger.info(f"[Shopify] No change needed, skipping.")
+        logger.info("[Shopify] No adjustment needed")
         return True
 
     url = f"https://{SHOPIFY_STORE_URL}/admin/api/2024-01/inventory_levels/adjust.json"
     payload = {
-        "location_id":            int(location_id),
-        "inventory_item_id":      int(inventory_item_id),
-        "available_adjustment":   adjustment
+        "location_id":          int(location_id),
+        "inventory_item_id":    int(inventory_item_id),
+        "available_adjustment": adjustment
     }
-    resp = requests.post(url, json=payload, headers=get_shopify_headers())
+    resp = requests.post(url, json=payload, headers=shopify_headers())
     if resp.status_code == 200:
-        logger.info(f"✅ Shopify updated: item {inventory_item_id} → {new_quantity} units (adj: {adjustment:+d})")
+        logger.info(f"[Shopify] ✅ Inventory set to {target_qty} (adj {adjustment:+d})")
         return True
     else:
-        logger.error(f"❌ Shopify update failed: {resp.status_code} {resp.text}")
+        logger.error(f"[Shopify] ❌ Failed: {resp.status_code} {resp.text}")
         return False
 
 
-def verify_shopify_webhook(data, hmac_header):
-    """Verify that the webhook actually came from Shopify."""
-    if not SHOPIFY_WEBHOOK_SECRET:
-        return True  # Skip verification if secret not set
-    digest = hmac.new(
-        SHOPIFY_WEBHOOK_SECRET.encode("utf-8"),
-        data,
-        hashlib.sha256
-    ).digest()
-    computed = base64.b64encode(digest).decode("utf-8")
-    return hmac.compare_digest(computed, hmac_header or "")
+# ══════════════════════════════════════════════════════════════════════════════
+# LARK HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
 
-
-def get_shopify_inventory_level(inventory_item_id, location_id):
-    """Get current inventory level from Shopify for a given item and location."""
-    url = f"https://{SHOPIFY_STORE_URL}/admin/api/2024-01/inventory_levels.json"
-    headers = get_shopify_headers()
-    params = {
-        "inventory_item_ids": inventory_item_id,
-        "location_ids": location_id
-    }
-    resp = requests.get(url, headers=headers, params=params)
+def get_lark_token():
+    url = "https://open.larksuite.com/open-apis/auth/v3/tenant_access_token/internal"
+    resp = requests.post(url, json={"app_id": LARK_APP_ID, "app_secret": LARK_APP_SECRET})
     data = resp.json()
-    levels = data.get("inventory_levels", [])
-    if levels:
-        return levels[0].get("available", 0)
-    return 0
+    if data.get("code") != 0:
+        raise Exception(f"Lark auth failed: {data}")
+    return data["tenant_access_token"]
+
+
+def find_lark_record(token, sku):
+    """Find a Lark Base record by SKU. Returns (record_id, current_stock) or (None, None)."""
+    url = f"https://open.larksuite.com/open-apis/bitable/v1/apps/{LARK_BASE_ID}/tables/{LARK_TABLE_ID}/records/search"
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    payload = {
+        "filter": {
+            "conjunction": "and",
+            "conditions": [{"field_name": "Variant SKU", "operator": "is", "value": [sku]}]
+        }
+    }
+    resp = requests.post(url, json=payload, headers=headers)
+    data = resp.json()
+    items = data.get("data", {}).get("items", [])
+    if not items:
+        logger.info(f"[Lark] SKU '{sku}' not found in Lark Base")
+        return None, None
+    record = items[0]
+    stock = record.get("fields", {}).get("Available Stock", 0)
+    logger.info(f"[Lark] Found SKU={sku}, stock={stock}")
+    return record["record_id"], stock
+
+
+def update_lark_record(token, record_id, new_qty):
+    """Update Available Stock field in a Lark Base record."""
+    url = f"https://open.larksuite.com/open-apis/bitable/v1/apps/{LARK_BASE_ID}/tables/{LARK_TABLE_ID}/records/{record_id}"
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    resp = requests.put(url, json={"fields": {"Available Stock": new_qty}}, headers=headers)
+    if resp.status_code == 200:
+        logger.info(f"[Lark] ✅ Record {record_id} updated to {new_qty}")
+        return True
+    else:
+        logger.error(f"[Lark] ❌ Failed: {resp.status_code} {resp.text}")
+        return False
+
+
+def verify_shopify_hmac(raw_body, hmac_header):
+    if not SHOPIFY_WEBHOOK_SECRET:
+        return True
+    digest = hmac.new(SHOPIFY_WEBHOOK_SECRET.encode(), raw_body, hashlib.sha256).digest()
+    return hmac.compare_digest(base64.b64encode(digest).decode(), hmac_header or "")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# DIRECTION 1: Lark Base → Shopify
-# Endpoint called by Lark Base Automation
+# ROUTE 1: Lark Base -> Shopify
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.route("/sync/lark-to-shopify", methods=["POST"])
 def lark_to_shopify():
-    """
-    Receives webhook from Lark Base Automation when Available Stock changes.
-
-    Expected JSON body (set in Lark Automation → HTTP Request action):
-    {
-        "secret": "your_webhook_secret",
-        "sku": "{{Variant SKU}}",
-        "available_stock": "{{Available Stock}}"
-    }
-    """
     try:
         data = request.get_json(force=True)
-        logger.info(f"[Lark→Shopify] Received: {json.dumps(data)}")
+        logger.info(f"[Lark->Shopify] {json.dumps(data)}")
 
-        # Validate secret
         if WEBHOOK_SECRET and data.get("secret") != WEBHOOK_SECRET:
             return jsonify({"status": "error", "message": "Unauthorized"}), 401
 
-        sku             = str(data.get("sku", "")).strip()
-        available_stock = data.get("available_stock")
+        sku = str(data.get("sku", "")).strip()
+        stock = data.get("available_stock")
 
         if not sku:
             return jsonify({"status": "error", "message": "Missing SKU"}), 400
-        if available_stock is None:
+        if stock is None:
             return jsonify({"status": "error", "message": "Missing available_stock"}), 400
 
-        try:
-            quantity = int(float(str(available_stock)))
-        except ValueError:
-            return jsonify({"status": "error", "message": f"Invalid quantity: {available_stock}"}), 400
+        target_qty = int(float(str(stock)))
+        logger.info(f"[Lark->Shopify] SKU={sku}, target_qty={target_qty}")
 
-        logger.info(f"[Lark→Shopify] SKU={sku}, Qty={quantity}")
-
-        variant_info = get_shopify_variant_by_sku(sku)
-        if not variant_info:
+        variant = get_shopify_variant(sku)
+        if not variant:
             return jsonify({"status": "skipped", "message": f"SKU '{sku}' not in Shopify"}), 200
 
-        success = update_shopify_inventory(
-            variant_info["inventory_item_id"],
-            variant_info["location_id"],
-            quantity
+        success = set_shopify_inventory(
+            variant["inventory_item_id"],
+            variant["location_id"],
+            target_qty,
+            variant["current_qty"]
         )
 
-        if success:
-            return jsonify({"status": "success", "sku": sku, "quantity_set": quantity}), 200
-        else:
-            return jsonify({"status": "error", "message": "Shopify update failed"}), 500
+        return jsonify({
+            "status": "success" if success else "error",
+            "sku": sku,
+            "target_qty": target_qty,
+            "previous_qty": variant["current_qty"]
+        }), 200 if success else 500
 
     except Exception as e:
-        logger.error(f"[Lark→Shopify] Error: {str(e)}", exc_info=True)
+        logger.error(f"[Lark->Shopify] Error: {e}", exc_info=True)
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# DIRECTION 2: Shopify → Lark Base
-# Endpoint called by Shopify order/fulfillment webhook
+# ROUTE 2: Shopify Order Created -> Lark Base (deduct stock)
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.route("/sync/shopify-to-lark", methods=["POST"])
 def shopify_to_lark():
-    """
-    Receives webhook from Shopify when an order is CREATED.
-    Deducts ordered quantities from Lark Base Available Stock immediately.
-
-    Register this URL in Shopify Admin:
-      Settings → Notifications → Webhooks
-      Event: Order created
-      URL: https://your-app.onrender.com/sync/shopify-to-lark
-    """
     try:
-        raw_body    = request.get_data()
+        raw_body = request.get_data()
         hmac_header = request.headers.get("X-Shopify-Hmac-Sha256", "")
-
-        # Verify webhook came from Shopify
-        if not verify_shopify_webhook(raw_body, hmac_header):
-            logger.warning("[Shopify→Lark] Invalid HMAC — rejected.")
+        if not verify_shopify_hmac(raw_body, hmac_header):
             return jsonify({"status": "error", "message": "Unauthorized"}), 401
 
         order = json.loads(raw_body)
-        logger.info(f"[Shopify→Lark] Order created — deducting stock")
+        logger.info(f"[Shopify->Lark] Order #{order.get('order_number')} created")
 
-        # Get Lark access token once for all updates
-        token = get_lark_access_token()
-
+        token = get_lark_token()
         results = []
-        line_items = order.get("line_items", [])
 
-        for item in line_items:
-            sku      = str(item.get("sku", "")).strip()
-            qty_sold = int(item.get("quantity", 0))
-
+        for item in order.get("line_items", []):
+            sku = str(item.get("sku", "")).strip()
+            qty = int(item.get("quantity", 0))
             if not sku:
-                logger.info(f"[Shopify→Lark] Line item has no SKU, skipping.")
                 continue
 
-            logger.info(f"[Shopify→Lark] Processing SKU={sku}, qty_sold={qty_sold}")
-
-            # Find record in Lark Base
-            record_id, current_stock = find_lark_record_by_sku(token, sku)
+            record_id, current_stock = find_lark_record(token, sku)
             if not record_id:
-                results.append({"sku": sku, "status": "skipped", "reason": "not in Lark Base"})
+                results.append({"sku": sku, "status": "skipped"})
                 continue
 
-            # Deduct sold quantity (never go below 0)
-            new_stock = max(0, int(current_stock or 0) - qty_sold)
-            logger.info(f"[Shopify→Lark] SKU={sku}: {current_stock} - {qty_sold} = {new_stock}")
-
-            success = update_lark_stock(token, record_id, new_stock)
-            results.append({
-                "sku":       sku,
-                "status":    "success" if success else "error",
-                "old_stock": current_stock,
-                "new_stock": new_stock
-            })
+            new_stock = max(0, int(current_stock or 0) - qty)
+            success = update_lark_record(token, record_id, new_stock)
+            results.append({"sku": sku, "old": current_stock, "new": new_stock, "status": "success" if success else "error"})
 
         return jsonify({"status": "success", "results": results}), 200
 
     except Exception as e:
-        logger.error(f"[Shopify→Lark] Error: {str(e)}", exc_info=True)
+        logger.error(f"[Shopify->Lark] Error: {e}", exc_info=True)
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# DIRECTION 3: Shopify Order Cancelled → Lark Base (Restore Stock)
-# Endpoint called by Shopify order cancelled webhook
+# ROUTE 3: Shopify Order Cancelled -> Lark Base (restore stock)
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.route("/sync/shopify-order-cancelled", methods=["POST"])
 def shopify_order_cancelled():
-    """
-    Receives webhook from Shopify when an order is CANCELLED.
-    Restores the cancelled quantities back to Lark Base Available Stock.
-
-    Register this URL in Shopify Admin:
-      Settings → Notifications → Webhooks
-      Event: Order cancelled
-      URL: https://your-app.onrender.com/sync/shopify-order-cancelled
-    """
     try:
-        raw_body    = request.get_data()
+        raw_body = request.get_data()
         hmac_header = request.headers.get("X-Shopify-Hmac-Sha256", "")
-
-        # Verify webhook came from Shopify
-        if not verify_shopify_webhook(raw_body, hmac_header):
-            logger.warning("[Shopify→Lark Cancelled] Invalid HMAC — rejected.")
+        if not verify_shopify_hmac(raw_body, hmac_header):
             return jsonify({"status": "error", "message": "Unauthorized"}), 401
 
         order = json.loads(raw_body)
-        order_number = order.get("order_number")
-        logger.info(f"[Shopify→Lark] Order #{order_number} cancelled — restoring stock")
+        logger.info(f"[Shopify Cancelled] Order #{order.get('order_number')} cancelled")
 
-        # Get Lark access token once for all updates
-        token = get_lark_access_token()
-
+        token = get_lark_token()
         results = []
-        line_items = order.get("line_items", [])
 
-        for item in line_items:
-            sku          = str(item.get("sku", "")).strip()
-            qty_cancelled = int(item.get("quantity", 0))
-
+        for item in order.get("line_items", []):
+            sku = str(item.get("sku", "")).strip()
+            qty = int(item.get("quantity", 0))
             if not sku:
-                logger.info(f"[Shopify→Lark Cancelled] Line item has no SKU, skipping.")
                 continue
 
-            logger.info(f"[Shopify→Lark Cancelled] Restoring SKU={sku}, qty={qty_cancelled}")
-
-            # Find record in Lark Base
-            record_id, current_stock = find_lark_record_by_sku(token, sku)
+            record_id, current_stock = find_lark_record(token, sku)
             if not record_id:
-                results.append({"sku": sku, "status": "skipped", "reason": "not in Lark Base"})
+                results.append({"sku": sku, "status": "skipped"})
                 continue
 
-            # Add back the cancelled quantity
-            new_stock = int(current_stock or 0) + qty_cancelled
-            logger.info(f"[Shopify→Lark Cancelled] SKU={sku}: {current_stock} + {qty_cancelled} = {new_stock}")
-
-            success = update_lark_stock(token, record_id, new_stock)
-            results.append({
-                "sku":       sku,
-                "status":    "success" if success else "error",
-                "old_stock": current_stock,
-                "new_stock": new_stock
-            })
+            new_stock = int(current_stock or 0) + qty
+            success = update_lark_record(token, record_id, new_stock)
+            results.append({"sku": sku, "old": current_stock, "new": new_stock, "status": "success" if success else "error"})
 
         return jsonify({"status": "success", "results": results}), 200
 
     except Exception as e:
-        logger.error(f"[Shopify→Lark Cancelled] Error: {str(e)}", exc_info=True)
+        logger.error(f"[Shopify Cancelled] Error: {e}", exc_info=True)
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
-
-
 # ══════════════════════════════════════════════════════════════════════════════
-# SHOPIFY OAUTH - Run once to get access token
-# ══════════════════════════════════════════════════════════════════════════════
-
-@app.route("/shopify/install", methods=["GET"])
-def shopify_install():
-    """Step 1: Redirect to Shopify OAuth page."""
-    shop = SHOPIFY_STORE_URL
-    client_id = SHOPIFY_CLIENT_ID
-    scopes = "read_products,read_inventory,write_inventory,read_orders,read_fulfillments"
-    redirect_uri = f"https://lark-shopify-sync.onrender.com/shopify/callback"
-    install_url = (
-        f"https://{shop}/admin/oauth/authorize"
-        f"?client_id={client_id}"
-        f"&scope={scopes}"
-        f"&redirect_uri={redirect_uri}"
-    )
-    from flask import redirect
-    return redirect(install_url)
-
-
-@app.route("/shopify/callback", methods=["GET"])
-def shopify_callback():
-    """Step 2: Exchange auth code for permanent access token."""
-    code = request.args.get("code")
-    if not code:
-        return jsonify({"error": "No code received"}), 400
-
-    url = f"https://{SHOPIFY_STORE_URL}/admin/oauth/access_token"
-    resp = requests.post(url, json={
-        "client_id": SHOPIFY_CLIENT_ID,
-        "client_secret": SHOPIFY_CLIENT_SECRET,
-        "code": code
-    })
-    data = resp.json()
-    token = data.get("access_token", "")
-    return jsonify({
-        "message": "Copy this token and add it to Render as SHOPIFY_ACCESS_TOKEN",
-        "access_token": token,
-        "full_response": data
-    }), 200
-
-# ══════════════════════════════════════════════════════════════════════════════
-# DEBUG: Test Shopify Connection
+# DEBUG ENDPOINTS
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.route("/debug/shopify/<sku>", methods=["GET"])
 def debug_shopify(sku):
-    """Test endpoint to check Shopify API connection and SKU lookup."""
     try:
-        headers = get_shopify_headers()
-        graphql_url = f"https://{SHOPIFY_STORE_URL}/admin/api/2024-01/graphql.json"
-        query = """
-        query getVariantBySku($query: String!) {
-          productVariants(first: 10, query: $query) {
-            edges {
-              node {
-                id
-                sku
-                title
-              }
-            }
-          }
-        }
-        """
-        variables = {"query": f"sku:{sku}"}
-        resp = requests.post(graphql_url, json={"query": query, "variables": variables}, headers=headers)
-        return jsonify({
-            "status_code": resp.status_code,
-            "shopify_url": SHOPIFY_STORE_URL,
-            "sku_searched": sku,
-            "response": resp.json()
-        }), 200
+        variant = get_shopify_variant(sku)
+        return jsonify({"sku": sku, "variant": variant}), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
-@app.route("/debug/auth", methods=["GET"])
-def debug_auth():
-    """Debug endpoint to verify auth headers being sent."""
-    import base64
+@app.route("/debug/token", methods=["GET"])
+def debug_token():
     try:
-        headers = get_shopify_headers()
-        # Show partial credentials for verification (never full secret)
-        client_id = SHOPIFY_CLIENT_ID or "NOT SET"
-        client_secret = SHOPIFY_CLIENT_SECRET or "NOT SET"
+        token = get_shopify_token()
         return jsonify({
-            "client_id": client_id,
-            "client_secret_length": len(client_secret),
-            "client_secret_first4": client_secret[:4] if client_secret else "NOT SET",
-            "client_secret_last4": client_secret[-4:] if client_secret else "NOT SET",
-            "auth_header_preview": headers.get("Authorization", "")[:30] + "...",
-            "shopify_url": SHOPIFY_STORE_URL or "NOT SET"
+            "token_prefix": token[:10] + "...",
+            "token_length": len(token),
+            "expires_at": _token_cache["expires_at"]
         }), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # HEALTH CHECK
