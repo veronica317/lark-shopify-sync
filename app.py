@@ -123,21 +123,56 @@ def update_lark_stock(token, record_id, new_quantity):
 # SHOPIFY HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
 
+# Cache token to avoid fetching on every request
+_shopify_token_cache = {"token": None, "expires_at": 0}
+
+def get_shopify_access_token():
+    """
+    Get a valid Shopify access token using client credentials grant.
+    Tokens expire every 24 hours so we cache and refresh automatically.
+    """
+    import time
+    now = time.time()
+
+    # Return cached token if still valid (with 5 min buffer)
+    if _shopify_token_cache["token"] and now < _shopify_token_cache["expires_at"] - 300:
+        return _shopify_token_cache["token"]
+
+    # Fetch new token
+    url = f"https://{SHOPIFY_STORE_URL}/admin/oauth/access_token"
+    resp = requests.post(url, json={
+        "client_id": SHOPIFY_CLIENT_ID,
+        "client_secret": SHOPIFY_CLIENT_SECRET,
+        "grant_type": "client_credentials"
+    }, headers={"Content-Type": "application/json"})
+
+    data = resp.json()
+    logger.info(f"[Shopify Token Response]: status={resp.status_code}")
+
+    token = data.get("access_token")
+    expires_in = data.get("expires_in", 86400)  # default 24h
+
+    if not token:
+        raise Exception(f"Failed to get Shopify token: {data}")
+
+    _shopify_token_cache["token"] = token
+    _shopify_token_cache["expires_at"] = now + expires_in
+
+    logger.info(f"[Shopify] Got new access token, expires in {expires_in}s")
+    return token
+
+
 def get_shopify_headers():
-    """
-    Build Shopify API headers.
-    Uses X-Shopify-Access-Token with the Client Secret directly.
-    This works for Dev Dashboard apps on Shopify.
-    """
+    """Build Shopify API headers with fresh access token."""
     return {
-        "X-Shopify-Access-Token": SHOPIFY_CLIENT_SECRET,
+        "X-Shopify-Access-Token": get_shopify_access_token(),
         "Content-Type": "application/json"
     }
 
 
 def get_shopify_token():
-    """Returns the client secret used as access token for Dev Dashboard apps."""
-    return SHOPIFY_CLIENT_SECRET or ""
+    """Returns current access token."""
+    return get_shopify_access_token()
 
 
 def get_shopify_variant_by_sku(sku):
@@ -468,6 +503,49 @@ def shopify_order_cancelled():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SHOPIFY OAUTH - Run once to get access token
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.route("/shopify/install", methods=["GET"])
+def shopify_install():
+    """Step 1: Redirect to Shopify OAuth page."""
+    shop = SHOPIFY_STORE_URL
+    client_id = SHOPIFY_CLIENT_ID
+    scopes = "read_products,read_inventory,write_inventory,read_orders,read_fulfillments"
+    redirect_uri = f"https://lark-shopify-sync.onrender.com/shopify/callback"
+    install_url = (
+        f"https://{shop}/admin/oauth/authorize"
+        f"?client_id={client_id}"
+        f"&scope={scopes}"
+        f"&redirect_uri={redirect_uri}"
+    )
+    from flask import redirect
+    return redirect(install_url)
+
+
+@app.route("/shopify/callback", methods=["GET"])
+def shopify_callback():
+    """Step 2: Exchange auth code for permanent access token."""
+    code = request.args.get("code")
+    if not code:
+        return jsonify({"error": "No code received"}), 400
+
+    url = f"https://{SHOPIFY_STORE_URL}/admin/oauth/access_token"
+    resp = requests.post(url, json={
+        "client_id": SHOPIFY_CLIENT_ID,
+        "client_secret": SHOPIFY_CLIENT_SECRET,
+        "code": code
+    })
+    data = resp.json()
+    token = data.get("access_token", "")
+    return jsonify({
+        "message": "Copy this token and add it to Render as SHOPIFY_ACCESS_TOKEN",
+        "access_token": token,
+        "full_response": data
+    }), 200
 
 # ══════════════════════════════════════════════════════════════════════════════
 # DEBUG: Test Shopify Connection
