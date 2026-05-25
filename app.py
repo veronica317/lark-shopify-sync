@@ -126,20 +126,18 @@ def update_lark_stock(token, record_id, new_quantity):
 def get_shopify_headers():
     """
     Build Shopify API headers.
-    Uses Basic Auth with Client ID + Secret (Dev Dashboard apps).
+    Uses X-Shopify-Access-Token with the Client Secret directly.
+    This works for Dev Dashboard apps on Shopify.
     """
-    import base64
-    credentials = f"{SHOPIFY_CLIENT_ID}:{SHOPIFY_CLIENT_SECRET}"
-    encoded = base64.b64encode(credentials.encode()).decode()
     return {
-        "Authorization": f"Basic {encoded}",
+        "X-Shopify-Access-Token": SHOPIFY_CLIENT_SECRET,
         "Content-Type": "application/json"
     }
 
 
 def get_shopify_token():
-    """Returns access token if set, otherwise empty string (Basic Auth used instead)."""
-    return SHOPIFY_ACCESS_TOKEN or ""
+    """Returns the client secret used as access token for Dev Dashboard apps."""
+    return SHOPIFY_CLIENT_SECRET or ""
 
 
 def get_shopify_variant_by_sku(sku):
