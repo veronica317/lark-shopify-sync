@@ -505,6 +505,27 @@ def debug_shopify(sku):
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+
+@app.route("/debug/auth", methods=["GET"])
+def debug_auth():
+    """Debug endpoint to verify auth headers being sent."""
+    import base64
+    try:
+        headers = get_shopify_headers()
+        # Show partial credentials for verification (never full secret)
+        client_id = SHOPIFY_CLIENT_ID or "NOT SET"
+        client_secret = SHOPIFY_CLIENT_SECRET or "NOT SET"
+        return jsonify({
+            "client_id": client_id,
+            "client_secret_length": len(client_secret),
+            "client_secret_first4": client_secret[:4] if client_secret else "NOT SET",
+            "client_secret_last4": client_secret[-4:] if client_secret else "NOT SET",
+            "auth_header_preview": headers.get("Authorization", "")[:30] + "...",
+            "shopify_url": SHOPIFY_STORE_URL or "NOT SET"
+        }), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 # ══════════════════════════════════════════════════════════════════════════════
 # HEALTH CHECK
 # ══════════════════════════════════════════════════════════════════════════════
