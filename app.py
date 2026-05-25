@@ -123,27 +123,23 @@ def update_lark_stock(token, record_id, new_quantity):
 # SHOPIFY HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
 
-def get_shopify_token():
+def get_shopify_headers():
     """
-    Get Shopify access token.
-    Uses SHOPIFY_ACCESS_TOKEN if set (shpat_...).
-    Otherwise uses Client ID + Secret to get an offline access token.
+    Build Shopify API headers.
+    Uses Basic Auth with Client ID + Secret (Dev Dashboard apps).
     """
-    if SHOPIFY_ACCESS_TOKEN:
-        return SHOPIFY_ACCESS_TOKEN
+    import base64
+    credentials = f"{SHOPIFY_CLIENT_ID}:{SHOPIFY_CLIENT_SECRET}"
+    encoded = base64.b64encode(credentials.encode()).decode()
+    return {
+        "Authorization": f"Basic {encoded}",
+        "Content-Type": "application/json"
+    }
 
-    # Use client credentials to get access token
-    url = f"https://{SHOPIFY_STORE_URL}/admin/oauth/access_token"
-    resp = requests.post(url, json={
-        "client_id": SHOPIFY_CLIENT_ID,
-        "client_secret": SHOPIFY_CLIENT_SECRET,
-        "grant_type": "client_credentials"
-    })
-    data = resp.json()
-    token = data.get("access_token")
-    if not token:
-        raise Exception(f"Failed to get Shopify token: {data}")
-    return token
+
+def get_shopify_token():
+    """Returns access token if set, otherwise empty string (Basic Auth used instead)."""
+    return SHOPIFY_ACCESS_TOKEN or ""
 
 
 def get_shopify_variant_by_sku(sku):
@@ -151,10 +147,7 @@ def get_shopify_variant_by_sku(sku):
     Search Shopify for a product variant matching the given SKU.
     Returns dict with variant_id, inventory_item_id, location_id or None.
     """
-    headers = {
-        "X-Shopify-Access-Token": get_shopify_token(),
-        "Content-Type": "application/json"
-    }
+        headers = get_shopify_headers()
     graphql_url = f"https://{SHOPIFY_STORE_URL}/admin/api/2024-01/graphql.json"
     query = """
     query getVariantBySku($query: String!) {
@@ -207,10 +200,7 @@ def get_shopify_variant_by_sku(sku):
 def update_shopify_inventory(inventory_item_id, location_id, new_quantity):
     """Set the inventory level for a specific item at a location."""
     url = f"https://{SHOPIFY_STORE_URL}/admin/api/2024-01/inventory_levels/set.json"
-    headers = {
-        "X-Shopify-Access-Token": get_shopify_token(),
-        "Content-Type": "application/json"
-    }
+        headers = get_shopify_headers()
     payload = {
         "location_id":        int(location_id),
         "inventory_item_id":  int(inventory_item_id),
@@ -241,7 +231,7 @@ def verify_shopify_webhook(data, hmac_header):
 def get_shopify_inventory_level(inventory_item_id, location_id):
     """Get current inventory level from Shopify for a given item and location."""
     url = f"https://{SHOPIFY_STORE_URL}/admin/api/2024-01/inventory_levels.json"
-    headers = {"X-Shopify-Access-Token": SHOPIFY_ACCESS_TOKEN}
+    headers = get_shopify_headers()
     params = {
         "inventory_item_ids": inventory_item_id,
         "location_ids": location_id
@@ -462,10 +452,7 @@ def shopify_order_cancelled():
 def debug_shopify(sku):
     """Test endpoint to check Shopify API connection and SKU lookup."""
     try:
-        headers = {
-            "X-Shopify-Access-Token": get_shopify_token(),
-            "Content-Type": "application/json"
-        }
+        headers = get_shopify_headers()
         graphql_url = f"https://{SHOPIFY_STORE_URL}/admin/api/2024-01/graphql.json"
         query = """
         query getVariantBySku($query: String!) {
