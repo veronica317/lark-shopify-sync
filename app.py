@@ -88,58 +88,54 @@ def shopify_headers():
 
 def get_shopify_variant(sku):
     """
-    Find a Shopify product variant by SKU using GraphQL.
+    Find a Shopify product variant by SKU using REST API.
     Returns dict with inventory_item_id, location_id, current_qty, or None.
     """
-    url = f"https://{SHOPIFY_STORE_URL}/admin/api/2024-01/graphql.json"
-    query = """
-    query getVariant($q: String!) {
-      productVariants(first: 5, query: $q) {
-        edges {
-          node {
-            id
-            sku
-            inventoryItem {
-              id
-              inventoryLevels(first: 1) {
-                edges {
-                  node {
-                    available
-                    location { id }
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-    """
-    variables = {"q": f"sku:{sku}"}
-    resp = requests.post(url, json={"query": query, "variables": variables}, headers=shopify_headers())
+    # Step 1: Search for variant by SKU via REST
+    url = f"https://{SHOPIFY_STORE_URL}/admin/api/2024-01/variants.json"
+    params = {"fields": "id,sku,inventory_item_id", "limit": 250}
+    
+    # Shopify REST doesn't support SKU search directly, use product search
+    search_url = f"https://{SHOPIFY_STORE_URL}/admin/api/2024-01/products.json"
+    search_params = {"fields": "id,variants", "limit": 250}
+    
+    resp = requests.get(search_url, params=search_params, headers=shopify_headers())
     data = resp.json()
-    logger.info(f"[Shopify] GraphQL response: {json.dumps(data)}")
+    logger.info(f"[Shopify] Products REST status: {resp.status_code}")
 
-    edges = data.get("data", {}).get("productVariants", {}).get("edges", [])
-    for edge in edges:
-        node = edge["node"]
-        if node.get("sku") == sku:
-            inv_item = node["inventoryItem"]
-            levels = inv_item["inventoryLevels"]["edges"]
-            if not levels:
-                logger.warning(f"[Shopify] SKU {sku} has no inventory levels")
-                return None
-            level = levels[0]["node"]
-            result = {
-                "inventory_item_id": inv_item["id"].split("/")[-1],
-                "location_id":       level["location"]["id"].split("/")[-1],
-                "current_qty":       int(level.get("available") or 0)
-            }
-            logger.info(f"[Shopify] Found SKU={sku}, current_qty={result['current_qty']}")
-            return result
+    inventory_item_id = None
+    for product in data.get("products", []):
+        for variant in product.get("variants", []):
+            if variant.get("sku") == sku:
+                inventory_item_id = str(variant["inventory_item_id"])
+                logger.info(f"[Shopify] Found SKU={sku}, inventory_item_id={inventory_item_id}")
+                break
+        if inventory_item_id:
+            break
 
-    logger.info(f"[Shopify] SKU '{sku}' not found — skipping")
-    return None
+    if not inventory_item_id:
+        logger.info(f"[Shopify] SKU '{sku}' not found in any product variant")
+        return None
+
+    # Step 2: Get inventory levels for this item
+    levels_url = f"https://{SHOPIFY_STORE_URL}/admin/api/2024-01/inventory_levels.json"
+    levels_resp = requests.get(levels_url, params={"inventory_item_ids": inventory_item_id}, headers=shopify_headers())
+    levels_data = levels_resp.json()
+    logger.info(f"[Shopify] Inventory levels: {json.dumps(levels_data)}")
+
+    levels = levels_data.get("inventory_levels", [])
+    if not levels:
+        logger.warning(f"[Shopify] No inventory levels for item {inventory_item_id}")
+        return None
+
+    level = levels[0]
+    result = {
+        "inventory_item_id": inventory_item_id,
+        "location_id":       str(level["location_id"]),
+        "current_qty":       int(level.get("available") or 0)
+    }
+    logger.info(f"[Shopify] current_qty={result['current_qty']}, location={result['location_id']}")
+    return result
 
 
 # ══════════════════════════════════════════════════════════════════════════════
