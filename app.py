@@ -158,6 +158,7 @@ def get_shopify_variant_by_sku(sku):
 
     resp = requests.post(graphql_url, json={"query": query, "variables": gql_variables}, headers=headers)
     data = resp.json()
+    logger.info(f"[Shopify GraphQL Response]: {json.dumps(data)}")
 
     edges = data.get("data", {}).get("productVariants", {}).get("edges", [])
     for edge in edges:
@@ -426,6 +427,44 @@ def shopify_order_cancelled():
         logger.error(f"[Shopify→Lark Cancelled] Error: {str(e)}", exc_info=True)
         return jsonify({"status": "error", "message": str(e)}), 500
 
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DEBUG: Test Shopify Connection
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.route("/debug/shopify/<sku>", methods=["GET"])
+def debug_shopify(sku):
+    """Test endpoint to check Shopify API connection and SKU lookup."""
+    try:
+        headers = {
+            "X-Shopify-Access-Token": SHOPIFY_ACCESS_TOKEN,
+            "Content-Type": "application/json"
+        }
+        graphql_url = f"https://{SHOPIFY_STORE_URL}/admin/api/2024-01/graphql.json"
+        query = """
+        query getVariantBySku($query: String!) {
+          productVariants(first: 10, query: $query) {
+            edges {
+              node {
+                id
+                sku
+                title
+              }
+            }
+          }
+        }
+        """
+        variables = {"query": f"sku:{sku}"}
+        resp = requests.post(graphql_url, json={"query": query, "variables": variables}, headers=headers)
+        return jsonify({
+            "status_code": resp.status_code,
+            "shopify_url": SHOPIFY_STORE_URL,
+            "sku_searched": sku,
+            "response": resp.json()
+        }), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 # ══════════════════════════════════════════════════════════════════════════════
 # HEALTH CHECK
