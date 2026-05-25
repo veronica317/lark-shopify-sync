@@ -27,7 +27,9 @@ logger = logging.getLogger(__name__)
 
 # ─── CONFIG (set these as Environment Variables on Render) ─────────────────────
 SHOPIFY_STORE_URL     = os.environ.get("SHOPIFY_STORE_URL")         # e.g. yourstore.myshopify.com
-SHOPIFY_ACCESS_TOKEN  = os.environ.get("SHOPIFY_ACCESS_TOKEN")      # Admin API access token
+SHOPIFY_ACCESS_TOKEN  = os.environ.get("SHOPIFY_ACCESS_TOKEN")      # Admin API access token (shpat_) OR leave blank if using Client ID/Secret
+SHOPIFY_CLIENT_ID     = os.environ.get("SHOPIFY_CLIENT_ID")         # Dev Dashboard Client ID
+SHOPIFY_CLIENT_SECRET = os.environ.get("SHOPIFY_CLIENT_SECRET")     # Dev Dashboard Client Secret
 SHOPIFY_WEBHOOK_SECRET= os.environ.get("SHOPIFY_WEBHOOK_SECRET")    # Shopify webhook signing secret
 LARK_APP_ID           = os.environ.get("LARK_APP_ID")               # From open.larksuite.com
 LARK_APP_SECRET       = os.environ.get("LARK_APP_SECRET")           # From open.larksuite.com
@@ -121,13 +123,36 @@ def update_lark_stock(token, record_id, new_quantity):
 # SHOPIFY HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
 
+def get_shopify_token():
+    """
+    Get Shopify access token.
+    Uses SHOPIFY_ACCESS_TOKEN if set (shpat_...).
+    Otherwise uses Client ID + Secret to get an offline access token.
+    """
+    if SHOPIFY_ACCESS_TOKEN:
+        return SHOPIFY_ACCESS_TOKEN
+
+    # Use client credentials to get access token
+    url = f"https://{SHOPIFY_STORE_URL}/admin/oauth/access_token"
+    resp = requests.post(url, json={
+        "client_id": SHOPIFY_CLIENT_ID,
+        "client_secret": SHOPIFY_CLIENT_SECRET,
+        "grant_type": "client_credentials"
+    })
+    data = resp.json()
+    token = data.get("access_token")
+    if not token:
+        raise Exception(f"Failed to get Shopify token: {data}")
+    return token
+
+
 def get_shopify_variant_by_sku(sku):
     """
     Search Shopify for a product variant matching the given SKU.
     Returns dict with variant_id, inventory_item_id, location_id or None.
     """
     headers = {
-        "X-Shopify-Access-Token": SHOPIFY_ACCESS_TOKEN,
+        "X-Shopify-Access-Token": get_shopify_token(),
         "Content-Type": "application/json"
     }
     graphql_url = f"https://{SHOPIFY_STORE_URL}/admin/api/2024-01/graphql.json"
@@ -183,7 +208,7 @@ def update_shopify_inventory(inventory_item_id, location_id, new_quantity):
     """Set the inventory level for a specific item at a location."""
     url = f"https://{SHOPIFY_STORE_URL}/admin/api/2024-01/inventory_levels/set.json"
     headers = {
-        "X-Shopify-Access-Token": SHOPIFY_ACCESS_TOKEN,
+        "X-Shopify-Access-Token": get_shopify_token(),
         "Content-Type": "application/json"
     }
     payload = {
@@ -438,7 +463,7 @@ def debug_shopify(sku):
     """Test endpoint to check Shopify API connection and SKU lookup."""
     try:
         headers = {
-            "X-Shopify-Access-Token": SHOPIFY_ACCESS_TOKEN,
+            "X-Shopify-Access-Token": get_shopify_token(),
             "Content-Type": "application/json"
         }
         graphql_url = f"https://{SHOPIFY_STORE_URL}/admin/api/2024-01/graphql.json"
