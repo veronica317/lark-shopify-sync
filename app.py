@@ -132,8 +132,8 @@ def get_shopify_variant_by_sku(sku):
     }
     graphql_url = f"https://{SHOPIFY_STORE_URL}/admin/api/2024-01/graphql.json"
     query = """
-    {
-      productVariants(first: 5, query: "sku:%s") {
+    query getVariantBySku($query: String!) {
+      productVariants(first: 10, query: $query) {
         edges {
           node {
             id
@@ -153,9 +153,10 @@ def get_shopify_variant_by_sku(sku):
         }
       }
     }
-    """ % sku.replace('"', '\\"')
+    """
+    gql_variables = {"query": f"sku:{sku}"}
 
-    resp = requests.post(graphql_url, json={"query": query}, headers=headers)
+    resp = requests.post(graphql_url, json={"query": query, "variables": gql_variables}, headers=headers)
     data = resp.json()
 
     edges = data.get("data", {}).get("productVariants", {}).get("edges", [])
