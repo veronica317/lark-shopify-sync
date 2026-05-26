@@ -37,6 +37,7 @@ LARK_APP_SECRET        = os.environ.get("LARK_APP_SECRET", "")         # From op
 LARK_BASE_ID           = os.environ.get("LARK_BASE_ID", "")            # From Lark Base URL
 LARK_TABLE_ID          = os.environ.get("LARK_TABLE_ID", "")           # From Lark Base URL
 WEBHOOK_SECRET         = os.environ.get("WEBHOOK_SECRET", "")          # Your secret for Lark automation
+SHOPIFY_PRIMARY_LOCATION_ID = os.environ.get("SHOPIFY_PRIMARY_LOCATION_ID", "3371524")  # Primary Shopify location ID
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -128,7 +129,21 @@ def get_shopify_variant(sku):
         logger.warning(f"[Shopify] No inventory levels for item {inventory_item_id}")
         return None
 
-    level = levels[0]
+    # Use the configured primary location
+    primary_location_id = SHOPIFY_PRIMARY_LOCATION_ID
+    level = None
+
+    # Find the matching location
+    for l in levels:
+        if str(l["location_id"]) == primary_location_id:
+            level = l
+            break
+
+    # Fallback to first location if primary not found
+    if not level:
+        logger.warning(f"[Shopify] Primary location {primary_location_id} not found, using first")
+        level = levels[0]
+
     result = {
         "inventory_item_id": inventory_item_id,
         "location_id":       str(level["location_id"]),
