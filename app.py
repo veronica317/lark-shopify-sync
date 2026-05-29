@@ -392,6 +392,50 @@ def debug_token():
         return jsonify({"error": str(e)}), 500
 
 
+
+@app.route("/debug/lark/<sku>", methods=["GET"])
+def debug_lark(sku):
+    """Debug endpoint to test Lark Base SKU search."""
+    try:
+        token = get_lark_token()
+        url = f"https://open.larksuite.com/open-apis/bitable/v1/apps/{LARK_BASE_ID}/tables/{LARK_TABLE_ID}/records/search"
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        payload = {
+            "filter": {
+                "conjunction": "and",
+                "conditions": [{"field_name": "Variant SKU", "operator": "is", "value": [sku]}]
+            }
+        }
+        resp = requests.post(url, json=payload, headers=headers)
+        data = resp.json()
+        items = data.get("data", {}).get("items", [])
+        if items:
+            record = items[0]
+            return jsonify({
+                "found": True,
+                "sku_searched": sku,
+                "record_id": record["record_id"],
+                "fields": record.get("fields", {})
+            }), 200
+        else:
+            # Also fetch first 5 records to compare SKUs
+            list_url = f"https://open.larksuite.com/open-apis/bitable/v1/apps/{LARK_BASE_ID}/tables/{LARK_TABLE_ID}/records"
+            list_resp = requests.get(list_url, headers=headers, params={"page_size": 5})
+            list_data = list_resp.json()
+            sample_skus = [
+                r.get("fields", {}).get("Variant SKU", "")
+                for r in list_data.get("data", {}).get("items", [])
+            ]
+            return jsonify({
+                "found": False,
+                "sku_searched": sku,
+                "sku_length": len(sku),
+                "sku_repr": repr(sku),
+                "sample_skus_in_lark": sample_skus
+            }), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 # ══════════════════════════════════════════════════════════════════════════════
 # HEALTH CHECK
 # ══════════════════════════════════════════════════════════════════════════════
